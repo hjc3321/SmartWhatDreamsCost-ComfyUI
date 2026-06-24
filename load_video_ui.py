@@ -72,8 +72,8 @@ class LoadVideoUI:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT")
-    RETURN_NAMES = ("images", "audio", "duration", "frame_count")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "IMAGE", "AUDIO", "INT")
+    RETURN_NAMES = ("images", "audio", "duration", "frame_count", "full_images", "full_audio", "full_frame_count")
     FUNCTION = "load_video"
     CATEGORY = "WhatDreamsCost"
 
@@ -82,7 +82,7 @@ class LoadVideoUI:
             # Return blank defaults if no video is loaded
             empty_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
             empty_audio = {"waveform": torch.zeros((1, 1, 44100)), "sample_rate": 44100}
-            return (empty_image, empty_audio, 0.0, 0)
+            return (empty_image, empty_audio, 0.0, 0, empty_image, empty_audio)
 
         # 1. Resolve path using ComfyUI standard paths or Absolute Path
         video_path = video  # Try exact/absolute path first
@@ -220,6 +220,14 @@ class LoadVideoUI:
         if actual_end_time <= 0:
             actual_end_time = float('inf') # Fallback if duration is unknown
 
+        # Save trim bounds for slicing later (used for images/audio outputs)
+        trim_start_time = actual_start_time
+        trim_end_time = actual_end_time
+
+        # Set extraction bounds to full video for full_images/full_audio outputs
+        actual_start_time = 0.0
+        actual_end_time = video_duration if video_duration > 0 else float('inf')
+
         # 2. Extract Video Frames (PyAV)
         frames = []
         image_tensor = None
@@ -338,6 +346,15 @@ class LoadVideoUI:
             # Fallback for an empty slice
             image_tensor = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
 
+        # Slice full video for trimmed output (images)
+        fr = float(frame_rate) if frame_rate > 0 else 24.0
+        start_idx = min(int(trim_start_time * fr), image_tensor.shape[0])
+        end_idx = int(trim_end_time * fr) if trim_end_time != float('inf') else image_tensor.shape[0]
+        end_idx = min(max(start_idx, end_idx), image_tensor.shape[0])
+        trimmed_image_tensor = image_tensor[start_idx:end_idx]
+        if trimmed_image_tensor.shape[0] == 0:
+            trimmed_image_tensor = image_tensor[:1].clone()
+
         # 3. Extract Audio (PyAV)
         audio_dict = {"waveform": torch.zeros((1, 1, 44100)), "sample_rate": 44100} # Default empty audio
         
@@ -406,18 +423,35 @@ class LoadVideoUI:
                 # Catch gracefully without breaking the pipeline execution
                 print(f"[LoadVideoUI] Audio track extraction skipped or failed: {e}")
 
+        # Slice full audio for trimmed output (audio)
+        audio_sr = audio_dict["sample_rate"]
+        full_waveform = audio_dict["waveform"]
+        if full_waveform.shape[2] > 0:
+            start_sample = min(int(trim_start_time * audio_sr), full_waveform.shape[2])
+            end_sample = int(trim_end_time * audio_sr) if trim_end_time != float('inf') else full_waveform.shape[2]
+            end_sample = min(max(start_sample, end_sample), full_waveform.shape[2])
+            trimmed_waveform = full_waveform[:, :, start_sample:end_sample]
+            if trimmed_waveform.shape[2] == 0:
+                trimmed_waveform = full_waveform[:, :, :1].clone()
+            trimmed_audio_dict = {"waveform": trimmed_waveform, "sample_rate": audio_sr}
+        else:
+            trimmed_audio_dict = audio_dict
+
         # Always close container to free up system memory lock
         container.close()
         
         # Output accurate final duration in seconds
-        final_duration_sec = float(max(0.0, actual_end_time - actual_start_time))
+        final_duration_sec = float(max(0.0, trim_end_time - trim_start_time))
         
-        # Accurately output the true number of extracted frames 
+        # Accurately output the true number of extracted frames
         # (Using the shape of the array provides exact 1:1 parity with the timeline's math)
-        frame_count = image_tensor.shape[0] if (frames_loaded > 0 or len(frames) > 0) else 0
+        frame_count = trimmed_image_tensor.shape[0] if (frames_loaded > 0 or len(frames) > 0) else 0
         if frame_count == 0 and final_duration_sec > 0:
              # Fallback estimation only if PyAV completely failed to decode a valid chunk
              calc_fr = float(frame_rate) if frame_rate > 0 else 24.0
              frame_count = int(np.floor(final_duration_sec * calc_fr))
 
-        return (image_tensor, audio_dict, final_duration_sec, frame_count)
+        # Output the full video frame count
+        full_frame_count = image_tensor.shape[0]
+
+        return (trimmed_image_tensor, trimmed_audio_dict, final_duration_sec, frame_count, image_tensor, audio_dict, full_frame_count)
