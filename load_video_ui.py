@@ -48,7 +48,7 @@ async def upload_chunk(request):
     return web.json_response({"status": "ok"})
 
 
-class LoadVideoUI:
+class SmartLoadVideoUI:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -75,7 +75,7 @@ class LoadVideoUI:
     RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "IMAGE", "AUDIO", "INT", "INT", "INT")
     RETURN_NAMES = ("images", "audio", "duration", "frame_count", "full_images", "full_audio", "full_frame_count", "start_frame", "end_frame")
     FUNCTION = "load_video"
-    CATEGORY = "WhatDreamsCost"
+    CATEGORY = "Smart-WhatDreamsCost"
 
     def load_video(self, video, frame_rate, display_mode, start_time, end_time, duration, start_frame, end_frame, duration_frames, custom_width=0, custom_height=0, resize_method="maintain aspect ratio", crop_x=0.0, crop_y=0.0, crop_w=1.0, crop_h=1.0, **kwargs):
         if not video:
@@ -108,6 +108,8 @@ class LoadVideoUI:
 
         orig_w = video_stream.codec_context.width if video_stream else 512
         orig_h = video_stream.codec_context.height if video_stream else 512
+        
+        print(f"[SmartLoadVideoUI] Video: {video_path}, Duration: {video_duration}s, Resolution: {orig_w}x{orig_h}")
 
         # Determine correct colorspace and color range for PyAV conversion to prevent color shift
         try:
@@ -334,26 +336,40 @@ class LoadVideoUI:
                     expected_target_time += frame_interval
 
         # Convert frames to ComfyUI Image standard format [N, H, W, C], float32, range 0.0-1.0
+        print(f"[SmartLoadVideoUI] frames_loaded: {frames_loaded}, frames list: {len(frames)}")
+        
         if image_tensor is not None:
             if frames_loaded > 0:
                 image_tensor = image_tensor[:frames_loaded]
             else:
+                print(f"[SmartLoadVideoUI] Warning: No frames loaded from video, using fallback")
                 image_tensor = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
         elif len(frames) > 0:
             frames_np = np.array(frames, dtype=np.float32) / 255.0
             image_tensor = torch.from_numpy(frames_np)
         else:
+            print(f"[SmartLoadVideoUI] Warning: Empty frame list, using fallback")
             # Fallback for an empty slice
             image_tensor = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
 
         # Slice full video for trimmed output (images)
         fr = float(frame_rate) if frame_rate > 0 else 24.0
-        start_idx = min(int(trim_start_time * fr), image_tensor.shape[0])
+        
+        # Calculate indices with proper bounds checking
+        start_idx = int(trim_start_time * fr)
         end_idx = int(trim_end_time * fr) if trim_end_time != float('inf') else image_tensor.shape[0]
-        end_idx = min(max(start_idx, end_idx), image_tensor.shape[0])
+        
+        # Ensure indices are within valid range
+        start_idx = max(0, min(start_idx, image_tensor.shape[0] - 1))
+        end_idx = max(start_idx + 1, min(end_idx, image_tensor.shape[0]))
+        
         trimmed_image_tensor = image_tensor[start_idx:end_idx]
+        
+        # Safety fallback: ensure we always have at least one frame
         if trimmed_image_tensor.shape[0] == 0:
             trimmed_image_tensor = image_tensor[:1].clone()
+            
+        print(f"[SmartLoadVideoUI] Loaded {image_tensor.shape[0]} frames, sliced from {start_idx} to {end_idx}, output: {trimmed_image_tensor.shape[0]} frames")
 
         # 3. Extract Audio (PyAV)
         audio_dict = {"waveform": torch.zeros((1, 1, 44100)), "sample_rate": 44100} # Default empty audio
